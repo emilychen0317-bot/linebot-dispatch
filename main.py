@@ -37,6 +37,13 @@ def init_sheet(ws):
     if not ws.row_values(1):
         ws.append_row(['上傳時間','工程名稱','工程地點','派工日期','司機姓名','車牌號碼','工作時數','工作內容','簽名確認','備註','狀態'])
 
+def download_image(message_id):
+    """直接用 HTTP 下載 LINE 圖片"""
+    url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
+    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+    resp = requests.get(url, headers=headers, timeout=30)
+    return base64.b64encode(resp.content).decode('utf-8')
+
 def analyze_image_with_gemini(image_data):
     prompt = '請仔細辨識這張工程派工單圖片，提取以下資訊並以 JSON 格式回傳：{"工程名稱":"","工程地點":"","派工日期":"","司機姓名":"","車牌號碼":"","工作時數":"","工作內容":"","簽名確認":"有/無","備註":""}。只回傳JSON不要其他文字。'
     payload = {"contents":[{"parts":[{"text":prompt},{"inline_data":{"mime_type":"image/jpeg","data":image_data}}]}]}
@@ -57,6 +64,10 @@ def push_msg(target_id, text):
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).push_message(PushMessageRequest(to=target_id, messages=[TextMessage(text=text)]))
 
+def reply_msg(reply_token, text):
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=text)]))
+
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
@@ -70,13 +81,15 @@ def callback():
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event):
     try:
-        with ApiClient(configuration) as api_client:
-            api = MessagingApi(api_client)
-            content = api.get_message_content(event.message.id)
-            image_data = base64.b64encode(content.read()).decode('utf-8')
-            api.reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text='📋 收到派工單，辨識中，請稍候...')]))
+        # 回覆處理中
+        reply_msg(event.reply_token, '📋 收到派工單，辨識中，請稍候...')
 
         target_id = getattr(event.source, 'group_id', None) or event.source.user_id
+
+        # 下載圖片
+        image_data = download_image(event.message.id)
+
+        # Gemini 分析
         data = parse_data(analyze_image_with_gemini(image_data))
 
         if not data:
@@ -96,6 +109,8 @@ def handle_image(event):
 
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
         target_id = getattr(event.source, 'group_id', None) or event.source.user_id
         push_msg(target_id, '⚠️ 系統發生錯誤，請稍後再試。')
 
