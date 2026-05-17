@@ -38,7 +38,6 @@ def init_sheet(ws):
         ws.append_row(['上傳時間','工程名稱','工程地點','派工日期','司機姓名','車牌號碼','工作時數','工作內容','簽名確認','備註','狀態'])
 
 def download_image(message_id):
-    """直接用 HTTP 下載 LINE 圖片"""
     url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
     headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
     resp = requests.get(url, headers=headers, timeout=30)
@@ -46,9 +45,25 @@ def download_image(message_id):
 
 def analyze_image_with_gemini(image_data):
     prompt = '請仔細辨識這張工程派工單圖片，提取以下資訊並以 JSON 格式回傳：{"工程名稱":"","工程地點":"","派工日期":"","司機姓名":"","車牌號碼":"","工作時數":"","工作內容":"","簽名確認":"有/無","備註":""}。只回傳JSON不要其他文字。'
-    payload = {"contents":[{"parts":[{"text":prompt},{"inline_data":{"mime_type":"image/jpeg","data":image_data}}]}]}
-    resp = requests.post(f"{GEMINI_API_URL}?key={GEMINI_API_KEY}", json=payload, timeout=30)
-    return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    payload = {
+        "contents":[{
+            "parts":[
+                {"text": prompt},
+                {"inline_data": {"mime_type": "image/jpeg", "data": image_data}}
+            ]
+        }],
+        "generationConfig": {"temperature": 0.1}
+    }
+    resp = requests.post(f"{GEMINI_API_URL}?key={GEMINI_API_KEY}", json=payload, timeout=60)
+    result = resp.json()
+    print(f"Gemini response status: {resp.status_code}")
+    print(f"Gemini response: {json.dumps(result, ensure_ascii=False)[:500]}")
+    
+    if 'candidates' not in result:
+        error_msg = result.get('error', {}).get('message', '未知錯誤')
+        raise Exception(f"Gemini API 錯誤: {error_msg}")
+    
+    return result["candidates"][0]["content"]["parts"][0]["text"]
 
 def parse_data(text):
     try:
@@ -81,19 +96,14 @@ def callback():
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event):
     try:
-        # 回覆處理中
         reply_msg(event.reply_token, '📋 收到派工單，辨識中，請稍候...')
-
         target_id = getattr(event.source, 'group_id', None) or event.source.user_id
-
-        # 下載圖片
         image_data = download_image(event.message.id)
-
-        # Gemini 分析
-        data = parse_data(analyze_image_with_gemini(image_data))
+        gemini_text = analyze_image_with_gemini(image_data)
+        data = parse_data(gemini_text)
 
         if not data:
-            push_msg(target_id, '⚠️ 無法辨識派工單，請確認圖片清晰後重新上傳。')
+            push_msg(target_id, f'⚠️ 無法解析辨識結果，請重新上傳清晰圖片。\n原始結果：{gemini_text[:200]}')
             return
 
         missing = [f for f in ['工程名稱','派工日期','司機姓名','車牌號碼','工作時數','簽名確認'] if not data.get(f) or data[f] in ('','無')]
@@ -112,7 +122,7 @@ def handle_image(event):
         import traceback
         traceback.print_exc()
         target_id = getattr(event.source, 'group_id', None) or event.source.user_id
-        push_msg(target_id, '⚠️ 系統發生錯誤，請稍後再試。')
+        push_msg(target_id, f'⚠️ 系統錯誤：{str(e)[:100]}')
 
 @app.route("/", methods=['GET'])
 def health():
