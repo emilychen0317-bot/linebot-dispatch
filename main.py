@@ -9,8 +9,6 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, ImageMessage, TextSendMessage
 from google.oauth2.service_account import Credentials
 from datetime import datetime
-import google.generativeai as genai
-
 app = Flask(__name__)
 
 # 環境變數
@@ -23,8 +21,8 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 設定 Gemini
-genai.configure(api_key=GEMINI_API_KEY)
+# Gemini API 直接透過 REST 呼叫
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
 def get_gsheet():
     """取得 Google Sheets 連線"""
@@ -50,9 +48,7 @@ def init_sheet(worksheet):
         ])
 
 def analyze_image_with_gemini(image_data):
-    """使用 Gemini 分析派工單圖片"""
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    
+    """使用 Gemini REST API 分析派工單圖片"""
     prompt = """請仔細辨識這張工程派工單圖片，提取以下資訊並以 JSON 格式回傳：
 {
   "工程名稱": "",
@@ -71,13 +67,22 @@ def analyze_image_with_gemini(image_data):
 - 日期格式請統一為 YYYY/MM/DD
 - 只回傳 JSON，不要其他說明文字"""
 
-    image_part = {
-        "mime_type": "image/jpeg",
-        "data": image_data
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": "image/jpeg", "data": image_data}}
+            ]
+        }]
     }
     
-    response = model.generate_content([prompt, image_part])
-    return response.text
+    resp = requests.post(
+        f"{GEMINI_API_URL}?key={GEMINI_API_KEY}",
+        json=payload,
+        timeout=30
+    )
+    result = resp.json()
+    return result["candidates"][0]["content"]["parts"][0]["text"]
 
 def parse_dispatch_data(gemini_response):
     """解析 Gemini 回傳的 JSON 資料"""
