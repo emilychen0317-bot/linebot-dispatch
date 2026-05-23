@@ -18,18 +18,25 @@ app = Flask(__name__)
 
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 GOOGLE_DRIVE_FILE_ID = os.environ.get('GOOGLE_DRIVE_FILE_ID')
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')
 
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+
+VISION_API_URL = "https://vision.googleapis.com/v1/images:annotate"
+
+def get_credentials():
+    service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    scopes = [
+        'https://www.googleapis.com/auth/cloud-vision',
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ]
+    return Credentials.from_service_account_info(service_account_info, scopes=scopes)
 
 def get_gsheet():
-    service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    scopes = ['https://www.googleapis.com/auth/spreadsheets','https://www.googleapis.com/auth/drive']
-    creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+    creds = get_credentials()
     gc = gspread.authorize(creds)
     return gc.open_by_key(GOOGLE_DRIVE_FILE_ID).sheet1
 
@@ -43,37 +50,116 @@ def download_image(message_id):
     resp = requests.get(url, headers=headers, timeout=30)
     return base64.b64encode(resp.content).decode('utf-8')
 
-def analyze_image_with_gemini(image_data):
-    prompt = '請仔細辨識這張工程派工單圖片，提取以下資訊並以 JSON 格式回傳：{"工程名稱":"","工程地點":"","派工日期":"","司機姓名":"","車牌號碼":"","工作時數":"","工作內容":"","簽名確認":"有/無","備註":""}。只回傳JSON不要其他文字。'
-    payload = {
-        "contents":[{
-            "parts":[
-                {"text": prompt},
-                {"inline_data": {"mime_type": "image/jpeg", "data": image_data}}
-            ]
-        }],
-        "generationConfig": {"temperature": 0.1}
+def ocr_with_vision(image_data):
+    """使用 Google Cloud Vision API 進行 OCR"""
+    creds = get_credentials()
+    
+    # 取得 access token
+    import google.auth.transport.requests
+    request_obj = google.auth.transport.requests.Request()
+    creds.refresh(request_obj)
+    
+    headers = {
+        "Authorization": f"Bearer {creds.token}",
+        "Content-Type": "application/json"
     }
-    resp = requests.post(f"{GEMINI_API_URL}?key={GEMINI_API_KEY}", json=payload, timeout=60)
+    
+    payload = {
+        "requests": [{
+            "image": {"content": image_data},
+            "features": [{"type": "DOCUMENT_TEXT_DETECTION"}]
+        }]
+    }
+    
+    resp = requests.post(VISION_API_URL, json=payload, headers=headers, timeout=30)
     result = resp.json()
-    print(f"Gemini response status: {resp.status_code}")
-    print(f"Gemini response: {json.dumps(result, ensure_ascii=False)[:500]}")
+    print(f"Vision API response: {json.dumps(result, ensure_ascii=False)[:500]}")
     
-    if 'candidates' not in result:
-        error_msg = result.get('error', {}).get('message', '未知錯誤')
-        raise Exception(f"Gemini API 錯誤: {error_msg}")
+    if 'responses' not in result or not result['responses']:
+        raise Exception("Vision API 無回應")
     
-    return result["candidates"][0]["content"]["parts"][0]["text"]
+    response = result['responses'][0]
+    if 'error' in response:
+        raise Exception(f"Vision API 錯誤: {response['error'].get('message', '未知錯誤')}")
+    
+    if 'fullTextAnnotation' not in response:
+        return ""
+    
+    return response['fullTextAnnotation']['text']
 
-def parse_data(text):
-    try:
-        clean = text.strip()
-        if '```' in clean:
-            clean = clean.split('```')[1]
-            if clean.startswith('json'): clean = clean[4:]
-        return json.loads(clean.strip())
-    except:
-        return None
+def parse_text_to_data(text):
+    """將 OCR 文字解析為派工單資料"""
+    print(f"OCR 文字：{text}")
+    
+    data = {
+        "工程名稱": "",
+        "工程地點": "",
+        "派工日期": "",
+        "司機姓名": "",
+        "車牌號碼": "",
+        "工作時數": "",
+        "工作內容": "",
+        "簽名確認": "無",
+        "備註": ""
+    }
+    
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    full_text = ' '.join(lines)
+    
+    import re
+    
+    # 業主（工程名稱）
+    for pattern in [r'業主[：:]\s*(.+?)(?:\s|地點|$)', r'業主\s+(\S+)']:
+        m = re.search(pattern, full_text)
+        if m:
+            data['工程名稱'] = m.group(1).strip()
+            break
+    
+    # 地點
+    for pattern in [r'地點[：:]\s*(.+?)(?:\s{2,}|機型|$)', r'地點\s+(\S+)']:
+        m = re.search(pattern, full_text)
+        if m:
+            data['工程地點'] = m.group(1).strip()
+            break
+    
+    # 日期
+    for pattern in [r'(\d{2,3})[年/]\s*(\d{1,2})[月/]\s*(\d{1,2})', r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})']:
+        m = re.search(pattern, full_text)
+        if m:
+            y, mo, d = m.group(1), m.group(2), m.group(3)
+            if len(y) == 3:  # 民國年
+                y = str(int(y) + 1911)
+            data['派工日期'] = f"{y}/{mo.zfill(2)}/{d.zfill(2)}"
+            break
+    
+    # 車牌
+    m = re.search(r'車號[：:]?\s*([A-Z0-9]{2,4}[-‐–]\d{2,4})', full_text)
+    if not m:
+        m = re.search(r'([A-Z]{2,3}[-‐–]\d{4}|\d{2,4}[-‐–][A-Z]{2,3}|[A-Z0-9]{3,4}[-‐]\d{3,4})', full_text)
+    if m:
+        data['車牌號碼'] = m.group(1).strip()
+    
+    # 工作時數
+    m = re.search(r'合計\s*(\d+)\s*時', full_text)
+    if not m:
+        m = re.search(r'(\d+)\s*時', full_text)
+    if m:
+        data['工作時數'] = f"{m.group(1)}時"
+    
+    # 工作內容
+    m = re.search(r'工作內容[：:]?\s*(.+?)(?:備註|$)', full_text)
+    if m:
+        data['工作內容'] = m.group(1).strip()
+    
+    # 簽名確認（有業主簽名和司機簽名就算有）
+    if '業主簽名' in full_text or '簽名' in full_text:
+        data['簽名確認'] = '有'
+    
+    return data
+
+def check_missing(data):
+    required = ['工程名稱', '派工日期', '車牌號碼', '工作時數']
+    return [f for f in required if not data.get(f)]
 
 def push_msg(target_id, text):
     with ApiClient(configuration) as api_client:
@@ -98,22 +184,31 @@ def handle_image(event):
     try:
         reply_msg(event.reply_token, '📋 收到派工單，辨識中，請稍候...')
         target_id = getattr(event.source, 'group_id', None) or event.source.user_id
-        image_data = download_image(event.message.id)
-        gemini_text = analyze_image_with_gemini(image_data)
-        data = parse_data(gemini_text)
 
-        if not data:
-            push_msg(target_id, f'⚠️ 無法解析辨識結果，請重新上傳清晰圖片。\n原始結果：{gemini_text[:200]}')
+        image_data = download_image(event.message.id)
+        ocr_text = ocr_with_vision(image_data)
+
+        if not ocr_text:
+            push_msg(target_id, '⚠️ 無法辨識圖片文字，請確認圖片清晰後重新上傳。')
             return
 
-        missing = [f for f in ['工程名稱','派工日期','司機姓名','車牌號碼','工作時數','簽名確認'] if not data.get(f) or data[f] in ('','無')]
+        data = parse_text_to_data(ocr_text)
+        missing = check_missing(data)
+
         if missing:
-            push_msg(target_id, '❌ 資料不完整，缺少：\n' + '\n'.join(f'  • {f}' for f in missing) + '\n\n請補齊後重新上傳。')
+            push_msg(target_id, '❌ 以下欄位無法辨識：\n' + '\n'.join(f'  • {f}' for f in missing) + '\n\n請補齊後重新上傳。')
             return
 
         ws = get_gsheet()
         init_sheet(ws)
-        ws.append_row([datetime.now().strftime('%Y/%m/%d %H:%M'), data.get('工程名稱',''), data.get('工程地點',''), data.get('派工日期',''), data.get('司機姓名',''), data.get('車牌號碼',''), data.get('工作時數',''), data.get('工作內容',''), data.get('簽名確認',''), data.get('備註',''), '已登錄'])
+        ws.append_row([
+            datetime.now().strftime('%Y/%m/%d %H:%M'),
+            data.get('工程名稱',''), data.get('工程地點',''),
+            data.get('派工日期',''), data.get('司機姓名',''),
+            data.get('車牌號碼',''), data.get('工作時數',''),
+            data.get('工作內容',''), data.get('簽名確認',''),
+            data.get('備註',''), '已登錄'
+        ])
 
         push_msg(target_id, f"✅ 派工單登錄成功！\n\n📌 工程名稱：{data.get('工程名稱','')}\n📍 地點：{data.get('工程地點','')}\n📅 日期：{data.get('派工日期','')}\n👷 司機：{data.get('司機姓名','')}\n🚛 車牌：{data.get('車牌號碼','')}\n⏱️ 時數：{data.get('工作時數','')}\n✍️ 簽名：{data.get('簽名確認','')}\n\n資料已同步至 Google Drive ✓")
 
