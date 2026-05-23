@@ -140,11 +140,15 @@ def parse_text_to_data(text):
         data['車牌號碼'] = m.group(1).strip()
     
     # 工作時數 - 直接辨識合計欄位數字
-    m = re.search(r'合計[/／\s]*(\d+)\s*時', full_text)
+    # 先將 OCR 常見錯誤替換：合計後面的 / 或 I 可能是數字 1
+    full_text_fixed = re.sub(r'(合計\s*)[/／Il|](\d)', r'\g<1>1\2', full_text)
+    m = re.search(r'合計\s*(\d+)\s*時', full_text_fixed)
+    if not m:
+        m = re.search(r'合計[/／Il|\s]*(\d+)\s*時', full_text)
+    if not m:
+        m = re.search(r'合計[^0-9]*(\d+)', full_text_fixed)
     if not m:
         m = re.search(r'合計[^0-9]*(\d+)', full_text)
-    if not m:
-        m = re.search(r'合計\s*(\d+)', full_text)
     if m:
         data['工作時數'] = f"{m.group(1)}時"
     
